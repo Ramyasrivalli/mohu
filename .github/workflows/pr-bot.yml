@@ -52,14 +52,18 @@ jobs:
           base_sha: ${{ github.event.pull_request.base.sha }}
           sha: ${{ github.event.pull_request.head.sha }}
 
-      - name: Count changed crates
+      - name: Detect changed crates
         id: crates
         run: |
           crates=$(echo "${{ steps.changed.outputs.all_changed_files }}" \
-            | grep -oP 'crates/[^/]+' | sort -u | tr '\n' ', ' | sed 's/,$//')
+            | tr ' ' '\n' \
+            | grep -oP 'crates/[^/]+' \
+            | sort -u \
+            | tr '\n' ', ' \
+            | sed 's/,$//')
           echo "list=${crates:-none}" >> "$GITHUB_OUTPUT"
 
-      - name: Post PR summary comment
+      - name: Post summary comment
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
