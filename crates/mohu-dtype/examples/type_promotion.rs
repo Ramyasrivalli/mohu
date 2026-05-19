@@ -1,113 +1,281 @@
-// type_promotion.rs — Type promotion, casting rules, and scalar type detection
-//
-// Demonstrates mohu's NumPy-compatible type promotion system: how mixed-type
-// operations resolve to a common output type, and how casting modes control
-// which conversions are permitted.
-//
-// NumPy equivalents:
-//   np.result_type(np.int32, np.float32)   # => float64
-//   np.can_cast(np.float64, np.float32, casting='safe')  # => False
-//   np.result_type(42)                     # => int8 (minimum scalar type)
+//! Type promotion and casting walkthrough for `mohu-dtype`.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo run --example type_promotion -p mohu-dtype
+//! ```
+//!
+//! This example covers:
+//!   1. `DType::from_str`  — parsing NumPy-compatible dtype strings
+//!   2. `promote(a, b)`    — binary type promotion rules
+//!   3. `can_cast(from, to, mode)` — Safe / SameKind / Unsafe cast modes
+//!   4. `DType::widen` / `narrow` chains
+//!   5. `DType::real_dtype` and `complex_dtype` conversions
+//!   6. `ALL_DTYPES` iteration — full dtype table
 
 use mohu_dtype::{
+    promote,
+    can_cast,
+    CastMode,
     DType,
-    promote::{can_cast, common_type, minimum_scalar_type, promote, result_type, weak_promote, CastMode},
-    cast::{cast_scalar, cast_slice},
+    ALL_DTYPES,
 };
 
 fn main() {
-    // ── Type promotion (np.result_type) ────────────────────────────────────
-    // NumPy: np.result_type(np.int32, np.float32) => np.float64
-    println!("── Type promotion ──");
-    let pairs = [
-        (DType::I32,  DType::F32),   // integer + float → wider float
-        (DType::F16,  DType::F32),   // float + float → wider float
-        (DType::I64,  DType::F32),   // wide int + float → F64
-        (DType::C64,  DType::F64),   // complex + float → wider complex
-        (DType::Bool, DType::I32),   // bool + anything → anything
-        (DType::U8,   DType::I8),    // mixed sign → signed, one step wider
-        (DType::U32,  DType::I32),   // U32 + I32 → I64
+    section_1_from_str();
+    section_2_promote();
+    section_3_can_cast();
+    section_4_widen_narrow();
+    section_5_real_complex();
+    section_6_all_dtypes();
+}
+
+// =============================================================================
+// Section 1 — DType::from_str
+// =============================================================================
+
+fn section_1_from_str() {
+    println!("=================================================================");
+    println!("Section 1 — DType::from_str: parsing NumPy-compatible strings");
+    println!("=================================================================\n");
+
+    let cases = [
+        "bool",
+        "int8",   "int16",  "int32",  "int64",
+        "uint8",  "uint16", "uint32", "uint64",
+        "float16", "bfloat16",
+        "float32", "float64",
+        "complex64", "complex128",
     ];
-    for (a, b) in pairs {
-        let result = promote(a, b);
-        println!("  promote({}, {}) = {}", a, b, result);
+
+    for name in &cases {
+        let dtype: DType = name.parse().expect("all names above are valid");
+        println!("  {:>12}  =>  {:?}  (itemsize = {} bytes)",
+            name, dtype, dtype.itemsize());
     }
 
-    // Promotion is symmetric
-    println!("\n  Symmetry check:");
-    println!("  promote(I32, F32) = {}", promote(DType::I32, DType::F32));
-    println!("  promote(F32, I32) = {}", promote(DType::F32, DType::I32));
-    assert_eq!(promote(DType::I32, DType::F32), promote(DType::F32, DType::I32));
+    println!();
+}
 
-    // ── common_type (reduce over multiple dtypes) ──────────────────────────
-    // NumPy: np.result_type(np.int8, np.float32, np.int16)
-    println!("\n── Common type ──");
-    let dt = common_type(&[DType::I8, DType::F32, DType::I16]).unwrap();
-    println!("  common_type(I8, F32, I16) = {dt}"); // F32
+// =============================================================================
+// Section 2 — promote(a, b)
+// =============================================================================
 
-    let dt = common_type(&[DType::U8, DType::I32, DType::F16]).unwrap();
-    println!("  common_type(U8, I32, F16) = {dt}"); // F64
+fn section_2_promote() {
+    println!("=================================================================");
+    println!("Section 2 — promote(a, b): binary type promotion");
+    println!("=================================================================\n");
 
-    // ── result_type ────────────────────────────────────────────────────────
-    let rt = result_type(DType::I16, DType::F32).unwrap();
-    println!("\n  result_type(I16, F32) = {rt}");
+    let pairs = [
+        // int + int
+        (DType::I32,  DType::I64,   "int + wider int"),
+        (DType::I8,   DType::U8,    "signed + unsigned (same width)"),
+        (DType::U32,  DType::I32,   "unsigned + signed"),
+        // int + float
+        (DType::I32,  DType::F32,   "int + float32"),
+        (DType::I64,  DType::F32,   "int64 + float32"),
+        (DType::I64,  DType::F64,   "int64 + float64"),
+        // float + float
+        (DType::F16,  DType::F32,   "float16 + float32"),
+        (DType::F32,  DType::F64,   "float32 + float64"),
+        (DType::BF16, DType::F32,   "bfloat16 + float32"),
+        // anything + complex
+        (DType::F32,  DType::C64,   "float32 + complex64"),
+        (DType::F64,  DType::C64,   "float64 + complex64"),
+        (DType::I32,  DType::C128,  "int32 + complex128"),
+        (DType::C64,  DType::C128,  "complex64 + complex128"),
+    ];
 
-    // ── Casting modes (np.can_cast) ────────────────────────────────────────
-    // NumPy: np.can_cast(np.int8, np.float32, casting='safe')
-    println!("\n── Casting modes ──");
+    println!("  {:<30}  {:<12}  {:<12}  =>  result", "description", "lhs", "rhs");
+    println!("  {}", "-".repeat(70));
 
-    // Safe: no information loss
-    println!("  Safe casts:");
-    println!("    I8  → F32:  {}", can_cast(DType::I8, DType::F32, CastMode::Safe));   // true
-    println!("    F64 → F32:  {}", can_cast(DType::F64, DType::F32, CastMode::Safe));  // false
-    println!("    U8  → I16:  {}", can_cast(DType::U8, DType::I16, CastMode::Safe));   // true
-    println!("    U8  → I8:   {}", can_cast(DType::U8, DType::I8, CastMode::Safe));    // false
+    for (a, b, desc) in &pairs {
+        let result = promote(*a, *b);
 
-    // SameKind: within same kind, precision loss OK
-    println!("  SameKind casts:");
-    println!("    F64 → F32:  {}", can_cast(DType::F64, DType::F32, CastMode::SameKind)); // true
-    println!("    I32 → I16:  {}", can_cast(DType::I32, DType::I16, CastMode::SameKind)); // true
-    println!("    F32 → I32:  {}", can_cast(DType::F32, DType::I32, CastMode::SameKind)); // false
+        // Symmetry check: promote(a,b) must equal promote(b,a)
+        let result_rev = promote(*b, *a);
+        assert_eq!(
+            result, result_rev,
+            "promotion symmetry failed for {:?} and {:?}", a, b
+        );
 
-    // Unsafe: any cast allowed
-    println!("  Unsafe casts:");
-    println!("    F32 → I32:  {}", can_cast(DType::F32, DType::I32, CastMode::Unsafe)); // true
-    println!("    C64 → F32:  {}", can_cast(DType::C64, DType::F32, CastMode::Unsafe)); // true
-
-    // ── Scalar casting (cast_scalar / cast_slice) ──────────────────────────
-    // NumPy: int(np.float64(3.7))  => 3  (truncation)
-    println!("\n── Scalar casting ──");
-
-    let v: i32 = cast_scalar::<f64, i32>(3.7, CastMode::Unsafe).unwrap();
-    println!("  cast f64(3.7) → i32 = {v}");  // 3 (truncated)
-
-    let v: f64 = cast_scalar::<i16, f64>(42_i16, CastMode::Safe).unwrap();
-    println!("  cast i16(42)  → f64 = {v}");  // 42.0
-
-    // Slice casting
-    let src: Vec<f32> = vec![1.1, 2.5, 3.9, -4.2];
-    let mut dst = vec![0i32; 4];
-    cast_slice::<f32, i32>(&src, &mut dst, CastMode::Unsafe).unwrap();
-    println!("  cast_slice f32 → i32: {dst:?}");  // [1, 2, 3, -4]
-
-    // ── minimum_scalar_type (np.result_type for scalars) ───────────────────
-    // NumPy: np.result_type(42) => dtype('int8')
-    println!("\n── Minimum scalar type ──");
-    let values = [0.0, 200.0, -1.5, 70000.0, 1e308, -130.0];
-    for v in values {
-        println!("  minimum_scalar_type({v:>10}) = {}", minimum_scalar_type(v));
+        println!("  {:<30}  {:<12}  {:<12}  =>  {:?}  ✓ symmetric",
+            desc,
+            format!("{:?}", a),
+            format!("{:?}", b),
+            result,
+        );
     }
 
-    // ── Weak promotion (NumPy 2.0 semantics) ──────────────────────────────
-    // NumPy 2.0: np.array([1,2,3], dtype=int8) + 1  => int8 (scalar is "weak")
-    println!("\n── Weak promotion (NumPy 2.0) ──");
-    let array_dt = DType::I8;
-    let scalar_dt = DType::I64;
-    let result = weak_promote(array_dt, scalar_dt, true);
-    println!("  weak_promote(I8 array, I64 weak scalar) = {result}"); // I8
+    println!("\n  All promotion pairs verified symmetric.\n");
+}
 
-    let result = weak_promote(array_dt, scalar_dt, false);
-    println!("  weak_promote(I8 array, I64 strong)      = {result}"); // I64
+// =============================================================================
+// Section 3 — can_cast(from, to, mode)
+// =============================================================================
 
-    println!("\nDone!");
+fn section_3_can_cast() {
+    println!("=================================================================");
+    println!("Section 3 — can_cast(from, to, mode): Safe / SameKind / Unsafe");
+    println!("=================================================================\n");
+
+    println!("  Cast modes:");
+    println!("    Safe      — no data loss possible (value always preserved)");
+    println!("    SameKind  — within the same kind (int→int, float→float)");
+    println!("    Unsafe    — always allowed regardless of precision loss\n");
+
+    let cases: &[(DType, DType, &str)] = &[
+        // Safe casts
+        (DType::I32,  DType::I64,  "i32 → i64   : widening, always safe"),
+        (DType::F32,  DType::F64,  "f32 → f64   : widening float, always safe"),
+        (DType::U8,   DType::I16,  "u8  → i16   : fits without loss"),
+        (DType::Bool, DType::I8,   "bool → i8   : 0/1 fits in i8"),
+        // SameKind but not Safe
+        (DType::I64,  DType::I32,  "i64 → i32   : narrowing int, same kind"),
+        (DType::F64,  DType::F32,  "f64 → f32   : narrowing float, same kind"),
+        // Unsafe only
+        (DType::F32,  DType::I32,  "f32 → i32   : float→int, truncates"),
+        (DType::I64,  DType::U32,  "i64 → u32   : signed→unsigned, may wrap"),
+        (DType::C64,  DType::F32,  "c64 → f32   : complex→real, discards imag"),
+    ];
+
+    println!("  {:<45}  {:>6}  {:>9}  {:>8}",
+        "cast", "Safe", "SameKind", "Unsafe");
+    println!("  {}", "-".repeat(75));
+
+    for (from, to, desc) in cases {
+        let safe      = can_cast(*from, *to, CastMode::Safe);
+        let same_kind = can_cast(*from, *to, CastMode::SameKind);
+        let unsafe_   = can_cast(*from, *to, CastMode::Unsafe);
+
+        println!("  {:<45}  {:>6}  {:>9}  {:>8}",
+            desc,
+            if safe      { "yes" } else { "no" },
+            if same_kind { "yes" } else { "no" },
+            if unsafe_   { "yes" } else { "no" },
+        );
+    }
+
+    println!();
+}
+
+// =============================================================================
+// Section 4 — DType::widen / narrow chains
+// =============================================================================
+
+fn section_4_widen_narrow() {
+    println!("=================================================================");
+    println!("Section 4 — DType::widen and DType::narrow chains");
+    println!("=================================================================\n");
+
+    // Widen chain: start narrow, widen until no wider type exists
+    let start = DType::I8;
+    print!("  widen chain from {:?}:  {:?}", start, start);
+    let mut current = start;
+    while let Some(wider) = current.widen() {
+        print!("  ->  {:?}", wider);
+        current = wider;
+    }
+    println!("  (no wider int)");
+
+    let start = DType::F16;
+    print!("  widen chain from {:?}: {:?}", start, start);
+    let mut current = start;
+    while let Some(wider) = current.widen() {
+        print!("  ->  {:?}", wider);
+        current = wider;
+    }
+    println!("  (no wider float)");
+
+    println!();
+
+    // Narrow chain: start wide, narrow until no narrower type exists
+    let start = DType::I64;
+    print!("  narrow chain from {:?}: {:?}", start, start);
+    let mut current = start;
+    while let Some(narrower) = current.narrow() {
+        print!("  ->  {:?}", narrower);
+        current = narrower;
+    }
+    println!("  (no narrower int)");
+
+    let start = DType::F64;
+    print!("  narrow chain from {:?}: {:?}", start, start);
+    let mut current = start;
+    while let Some(narrower) = current.narrow() {
+        print!("  ->  {:?}", narrower);
+        current = narrower;
+    }
+    println!("  (no narrower float)");
+
+    println!();
+}
+
+// =============================================================================
+// Section 5 — real_dtype and complex_dtype conversions
+// =============================================================================
+
+fn section_5_real_complex() {
+    println!("=================================================================");
+    println!("Section 5 — real_dtype and complex_dtype conversions");
+    println!("=================================================================\n");
+
+    let float_types = [DType::F16, DType::BF16, DType::F32, DType::F64];
+    let complex_types = [DType::C64, DType::C128];
+
+    println!("  float → complex_dtype:");
+    for dt in &float_types {
+        let c = dt.complex_dtype();
+        println!("    {:?}  =>  {:?}", dt, c);
+    }
+
+    println!();
+    println!("  complex → real_dtype:");
+    for dt in &complex_types {
+        let r = dt.real_dtype();
+        println!("    {:?}  =>  {:?}", dt, r);
+    }
+
+    println!();
+
+    // Round-trip check: real_dtype(complex_dtype(f)) == f
+    println!("  Round-trip check: real_dtype(complex_dtype(x)) == x");
+    for dt in &float_types {
+        let round_tripped = dt.complex_dtype().real_dtype();
+        assert_eq!(
+            *dt, round_tripped,
+            "round-trip failed for {:?}", dt
+        );
+        println!("    {:?}  =>  complex  =>  real  =>  {:?}  ✓", dt, round_tripped);
+    }
+
+    println!();
+}
+
+// =============================================================================
+// Section 6 — ALL_DTYPES iteration
+// =============================================================================
+
+fn section_6_all_dtypes() {
+    println!("=================================================================");
+    println!("Section 6 — ALL_DTYPES: full dtype table");
+    println!("=================================================================\n");
+
+    println!("  {:<12}  {:>8}  {:>6}  {:>10}  {:>12}",
+        "name", "itemsize", "kind", "is_float", "is_integer");
+    println!("  {}", "-".repeat(56));
+
+    for dt in ALL_DTYPES {
+        println!("  {:<12}  {:>8}  {:>6}  {:>10}  {:>12}",
+            format!("{:?}", dt),
+            format!("{} B", dt.itemsize()),
+            dt.kind_char(),
+            dt.is_float(),
+            dt.is_integer(),
+        );
+    }
+
+    println!("\n  Total dtypes: {}", ALL_DTYPES.len());
+    println!();
 }
